@@ -2,132 +2,174 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+from io import BytesIO
 
-# ==================== 全局配置（和你最初确认的一致）====================
-plt.rcParams["font.family"] = "DejaVu Sans"  # 避免字体报错
+# ==================== 基础配置 ====================
+st.set_page_config(
+    page_title="剥离力曲线批量生成器",
+    page_icon="📊",
+    layout="wide"
+)
+
+# 初始化session_state，存储曲线数量和参数（默认3条，预填8/8/9）
+if "num_curves" not in st.session_state:
+    st.session_state.num_curves = 3
+if "curve_params" not in st.session_state:
+    st.session_state.curve_params = [
+        {"mean": 8.0, "dev": 30.0, "mode": "smooth", "end": 200},
+        {"mean": 8.0, "dev": 30.0, "mode": "smooth", "end": 200},
+        {"mean": 9.0, "dev": 30.0, "mode": "smooth", "end": 200}
+    ]
+
+# Matplotlib配置，避免字体报错
+plt.rcParams["font.family"] = "DejaVu Sans"
 plt.rcParams["axes.unicode_minus"] = False
 
-# 曲线参数（固定符合你的要求）
-X_TOTAL = 200          # 总横坐标长度
-CLIMB_END = 20         # 0-20mm爬升段
-VALID_START = 40       # s15标记位置（x=40）
-VALID_END = 160        # e15标记位置（x=160）
-DROP_START = 170       # 170mm后下降段
-BG_COLOR = "#e6f2ff"   # 浅蓝网格背景（和原软件一致）
-DEV_RANGE = 0.3        # 波动±30%
+# 剥离力测试固定参数（和你之前确认的一致）
+CLIMB_END = 20          # 爬升段结束（0-20mm）
+VALID_START = 40        # s15标记位置（x=40mm）
+VALID_END = 160         # e15标记位置（x=160mm）
+DROP_START = 170        # 下降段起始（170mm后）
+BG_COLOR = "#e6f2ff"    # 浅蓝网格背景，匹配原软件
+GRID_COLOR = "#b3d9ff"  # 网格线颜色
 
-# ==================== 核心曲线生成函数（最初验证通过的版本）====================
-def generate_peel_curve(base_mean):
-    x = np.arange(0, X_TOTAL + 1)
+# ==================== 核心曲线生成函数 ====================
+def generate_single_curve(mean: float, dev: float, mode: str, end: int):
+    """生成单条符合工业测试逻辑的剥离力曲线"""
+    x = np.arange(0, end + 1, 1)
     y = np.zeros_like(x, dtype=float)
+    base_noise = np.random.normal(0, mean * 0.03, len(x))
     
-    # 1. 0-20mm自然爬升
-    climb_mask = x <= CLIMB_END
-    y[climb_mask] = base_mean * 0.1 * np.exp(x[climb_mask] / 8)
-    
-    # 2. 20-40mm过渡段
-    trans_mask = (x > CLIMB_END) & (x < VALID_START)
-    y[trans_mask] = base_mean * (0.8 + 0.2 * (x[trans_mask] - CLIMB_END) / (VALID_START - CLIMB_END))
-    
-    # 3. 40-160mm有效波动区（带真实测试抖动）
-    valid_mask = (x >= VALID_START) & (x <= VALID_END)
-    valid_len = np.sum(valid_mask)
-    base_valid = base_mean * (1 + np.random.uniform(-DEV_RANGE, DEV_RANGE))
-    noise = np.random.normal(0, base_mean * 0.05, valid_len)
-    periodic = base_mean * 0.1 * np.sin(2 * np.pi * x[valid_mask] / 30)
-    y[valid_mask] = base_valid + noise + periodic
-    
-    # 4. 160-170mm预下降过渡
-    pre_drop_mask = (x > VALID_END) & (x < DROP_START)
-    y[pre_drop_mask] = y[VALID_END] * (1 - 0.2 * (x[pre_drop_mask] - VALID_END) / (DROP_START - VALID_END))
-    
-    # 5. 170-200mm指数下降
-    drop_mask = x >= DROP_START
-    y[drop_mask] = y[DROP_START] * np.exp(-(x[drop_mask] - DROP_START) / 20)
-    y[y < 0] = 0  # 避免负值
-    
+    for i in range(len(x)):
+        if i < CLIMB_END:
+            # 0-20mm自然爬升
+            y[i] = mean * 0.1 * np.exp(i / 8) + base_noise[i]
+        elif i < VALID_START:
+            # 20-40mm过渡段
+            progress = (i - CLIMB_END) / (VALID_START - CLIMB_END)
+            y[i] = mean * 0.8 + (mean - mean * 0.8) * progress + base_noise[i]
+        elif i < VALID_END:
+            # 40-160mm有效波动区（偏差±dev%）
+            wave = mean * 0.08 * np.sin(i * 0.1)
+            random_fluct = np.random.normal(0, mean * (dev/100) * 0.5)
+            y[i] = mean + wave + random_fluct + base_noise[i]
+        elif i < DROP_START:
+            # 160-170mm预下降过渡
+            progress = (i - VALID_END) / (DROP_START - VALID_END)
+            y[i] = y[VALID_END] * (1 - 0.2 * progress) + base_noise[i]
+        else:
+            # 170mm后下降段（支持3种模式）
+            if mode == "smooth":
+                y[i] = max(0, y[DROP_START] * np.exp(-(i - DROP_START) / 20) + base_noise[i])
+            elif mode == "peak":
+                peak = y[DROP_START] * 1.1 if np.random.rand() > 0.5 else y[DROP_START]
+                y[i] = max(0, peak * np.exp(-(i - DROP_START) / 25) + base_noise[i])
+            else:  # cut模式，直接截断到0
+                y[i] = 0
+    y[y < 0] = 0
     return x, y
 
-# ==================== Streamlit界面（最精简稳定版）====================
-st.set_page_config(page_title="Peel Force Tester", layout="wide")
-st.title("剥离力测试曲线生成器")
-st.caption("复刻工业剥离力测试软件风格 | 默认输入：8/8/9")
-
-# 侧边栏参数（默认填好你要的8、8、9）
+# ==================== 侧边栏：参数输入 ====================
 with st.sidebar:
-    st.header("测试参数")
-    mean1 = st.number_input("曲线1均值(gf)", value=8.0, step=0.1)
-    mean2 = st.number_input("曲线2均值(gf)", value=8.0, step=0.1)
-    mean3 = st.number_input("曲线3均值(gf)", value=9.0, step=0.1)
-    dev = st.slider("波动范围(%)", 10, 50, 30, step=5)
-    generate_btn = st.button("生成曲线", type="primary")
+    st.header("⚙️ 批量曲线参数")
+    st.caption(f"当前曲线数量：{st.session_state.num_curves}/50")
+    
+    # 添加/删除曲线按钮（最多50条）
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("➕ 添加曲线", disabled=st.session_state.num_curves >= 50):
+            st.session_state.num_curves += 1
+            st.session_state.curve_params.append({
+                "mean": 5.0, "dev": 30.0, "mode": "smooth", "end": 200
+            })
+    with col2:
+        if st.button("➖ 删除曲线", disabled=st.session_state.num_curves <= 1):
+            st.session_state.num_curves -= 1
+            st.session_state.curve_params.pop()
+    
+    st.divider()
+    
+    # 动态生成每条曲线的输入项
+    new_params = []
+    for i in range(st.session_state.num_curves):
+        st.subheader(f"曲线 {i+1}")
+        param = st.session_state.curve_params[i]
+        
+        mean = st.number_input(f"目标均值(gf)", min_value=0.1, value=param["mean"], step=0.1, key=f"mean_{i}")
+        dev = st.slider(f"偏差(%)", min_value=5, max_value=50, value=int(param["dev"]), step=5, key=f"dev_{i}")
+        mode = st.selectbox(f"下降模式", options=["smooth", "peak", "cut"], index=["smooth", "peak", "cut"].index(param["mode"]), key=f"mode_{i}")
+        end = st.number_input(f"终结位置(mm)", min_value=180, max_value=220, value=param["end"], step=10, key=f"end_{i}")
+        
+        new_params.append({"mean": mean, "dev": float(dev), "mode": mode, "end": end})
+        st.divider()
+    
+    st.session_state.curve_params = new_params
+    generate_btn = st.button("🚀 批量生成曲线", type="primary", use_container_width=True)
 
-# 主界面
+# ==================== 主界面：结果展示 ====================
+st.title("📈 剥离力曲线批量生成工具")
+st.caption("支持最多50条曲线批量生成，匹配工业剥离力测试软件标准")
+
 if generate_btn:
-    with st.spinner("生成曲线中..."):
-        # 生成三条曲线
-        input_means = [mean1, mean2, mean3]
-        curves = []
-        for i, mean in enumerate(input_means):
-            x, y = generate_peel_curve(mean)
-            curves.append({
-                "id": i+1,
-                "x": x,
-                "y": y,
-                "max": np.max(y),
-                "min": np.min(y),
-                "avg": np.mean(y[y>0])
+    with st.spinner(f"正在生成{st.session_state.num_curves}条曲线..."):
+        # 生成所有曲线
+        curves_data = []
+        for i, param in enumerate(st.session_state.curve_params):
+            x, y = generate_single_curve(param["mean"], param["dev"], param["mode"], param["end"])
+            curves_data.append({
+                "id": i+1, "x": x, "y": y, "mean": param["mean"], "dev": param["dev"],
+                "mode": param["mode"], "end": param["end"],
+                "max": round(np.max(y), 3), "min": round(np.min(y), 3), "avg": round(np.mean(y[y>0]), 3)
             })
         
-        # 绘制曲线
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
-        colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
-        
-        for i, curve in enumerate(curves):
-            ax.plot(curve["x"], curve["y"], color=colors[i], linewidth=1.5, 
-                    label=f"Plot {curve['id']} (μ={curve['mean']})")
-        
-        # 添加s15/e15标记
+        # 绘制曲线图（带s15/e15标记）
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
+        colors = plt.cm.tab20.colors
+        for i, curve in enumerate(curves_data):
+            ax.plot(curve["x"], curve["y"], color=colors[i%len(colors)], linewidth=1.2, label=f"Plot {curve['id']} (μ={curve['mean']}gf)")
         ax.axvline(x=VALID_START, color="#666666", linestyle=":", linewidth=1.2, label="s15")
         ax.axvline(x=VALID_END, color="#666666", linestyle=":", linewidth=1.2, label="e15")
         
-        # 样式设置（和原软件一致）
+        # 样式匹配原软件
         ax.set_facecolor(BG_COLOR)
-        ax.grid(True, color="#b3d9ff", linestyle="--", alpha=0.7)
+        ax.grid(True, color=GRID_COLOR, linestyle="--", alpha=0.7)
         ax.set_xlabel("变形 (mm)")
         ax.set_ylabel("剥离力 (gf)")
-        ax.set_title("剥离力测试曲线")
-        ax.legend(loc="upper right", fontsize=9)
+        ax.set_title(f"批量剥离力测试曲线（共{len(curves_data)}条）")
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
         plt.tight_layout()
         
-        # 显示曲线
+        # 显示结果
+        st.subheader("📊 曲线预览")
         st.pyplot(fig)
         
-        # 显示统计表格
-        st.subheader("测试数据统计")
-        stats_df = pd.DataFrame({
-            "编号": [f"Plot {c['id']}" for c in curves] + ["整体平均", "整体最大", "整体最小"],
-            "目标均值(gf)": [c["mean"] for c in curves] + ["-", "-", "-"],
-            "实测最大(gf)": [round(c["max"], 3) for c in curves] + [
-                round(np.mean([c["max"] for c in curves]), 3),
-                round(np.max([c["max"] for c in curves]), 3),
-                round(np.min([c["max"] for c in curves]), 3)
-            ],
-            "实测最小(gf)": [round(c["min"], 3) for c in curves] + [
-                round(np.mean([c["min"] for c in curves]), 3),
-                round(np.max([c["min"] for c in curves]), 3),
-                round(np.min([c["min"] for c in curves]), 3)
-            ],
-            "实测平均(gf)": [round(c["avg"], 3) for c in curves] + [
-                round(np.mean([c["avg"] for c in curves]), 3),
-                round(np.max([c["avg"] for c in curves]), 3),
-                round(np.min([c["avg"] for c in curves]), 3)
-            ]
+        # 统计表格
+        st.subheader("📋 测试数据统计")
+        single_stats = pd.DataFrame({
+            "曲线编号": [f"Plot {c['id']}" for c in curves_data],
+            "目标均值(gf)": [c["mean"] for c in curves_data],
+            "偏差(%)": [c["dev"] for c in curves_data],
+            "下降模式": [c["mode"] for c in curves_data],
+            "实测最大(gf)": [c["max"] for c in curves_data],
+            "实测最小(gf)": [c["min"] for c in curves_data],
+            "实测平均(gf)": [c["avg"] for c in curves_data]
         })
-        st.dataframe(stats_df, use_container_width=True)
+        st.dataframe(single_stats, use_container_width=True)
+        
+        # 下载功能
+        st.subheader("📥 数据下载")
+        col1, col2 = st.columns(2)
+        with col1:
+            img_buf = BytesIO()
+            fig.savefig(img_buf, format="png", bbox_inches="tight", dpi=300)
+            img_buf.seek(0)
+            st.download_button("下载曲线图(PNG)", img_buf, "peel_force_curves.png", "image/png")
+        with col2:
+            csv_buf = BytesIO()
+            single_stats.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+            csv_buf.seek(0)
+            st.download_button("下载统计数据(CSV)", csv_buf, "peel_force_stats.csv", "text/csv")
+        
+        st.success(f"✅ 成功生成{st.session_state.num_curves}条曲线！")
 else:
-    st.info("点击左侧「生成曲线」按钮，即可生成默认8/8/9的三条测试曲线")
-
-# ==================== 运行入口 ====================
-if __name__ == "__main__":
-    st.runtime.legacy_caching.clear_cache()
+    st.info("请在左侧边栏调整参数，点击「批量生成曲线」按钮开始生成。默认已预填3条曲线（均值8/8/9，偏差30%）")
