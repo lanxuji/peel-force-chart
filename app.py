@@ -1,178 +1,265 @@
+# app.py - Full English Version for Peel Force Analysis
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
 import pandas as pd
+import streamlit as st
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.drawing.image import Image as ExcelImage
-import os
+from io import BytesIO
 
-# ==========================================
-# 第一步：生成曲线图片（保持之前的逻辑）
-# ==========================================
-print("正在生成曲线图片...")
-np.random.seed(42) # 保证每次生成的图片一样，方便核对
+# ==================== Global Config ====================
+# Fix matplotlib font issue (no Chinese characters used)
+plt.rcParams["font.family"] = "DejaVu Sans"
+plt.rcParams["axes.unicode_minus"] = False
 
-def generate_curve_data(target_mean, base_dev=30, end_pos=200):
-    """生成单条符合物理规律的剥离力曲线"""
-    x = np.arange(0, end_pos + 1)
+# Test parameters (fixed per your requirements)
+CLIMB_END = 20          # Initial climb phase ends at 20mm
+VALID_START = 40        # Valid test zone starts at 40mm (s15 marker)
+VALID_END = 160         # Valid test zone ends at 160mm (e15 marker)
+DROP_START = 170        # Drop phase starts at 170mm
+MAX_DISPLACEMENT = 200  # Total displacement range 0-200mm
+DEFAULT_DEVIATION = 0.3 # ±30% fluctuation range
+BG_COLOR = "#e6f2ff"    # Light blue grid background (matches original software)
+
+# ==================== Core Curve Generation ====================
+def generate_single_curve(target_mean: float, deviation: float = DEFAULT_DEVIATION) -> tuple:
+    """
+    Generate a single peel force curve matching real test logic
+    Args:
+        target_mean: Target average peel force (gf)
+        deviation: Allowed fluctuation range (0-1 ratio)
+    Returns:
+        x: Displacement array (mm)
+        y: Peel force array (gf)
+    """
+    x = np.arange(0, MAX_DISPLACEMENT + 1)
     y = np.zeros_like(x, dtype=float)
+    base_noise = np.random.normal(0, target_mean * 0.05, len(x))
     
-    # 基础波动
-    dev = base_dev + np.random.normal(0, 5)
-    current_val = target_mean * 0.1 # 起始点
+    for i in range(len(x)):
+        if i < CLIMB_END:
+            # Phase 1: Natural climb from 0 to ~80% of target mean
+            y[i] = target_mean * 0.8 * (i / CLIMB_END) + base_noise[i]
+        elif i < VALID_START:
+            # Phase 2: Smooth transition to valid test zone
+            progress = (i - CLIMB_END) / (VALID_START - CLIMB_END)
+            y[i] = target_mean * 0.8 + (target_mean - target_mean * 0.8) * progress + base_noise[i]
+        elif i < VALID_END:
+            # Phase 3: Valid test zone with realistic fluctuations
+            wave = target_mean * 0.1 * np.sin(i * 0.1)  # Small periodic variation
+            random_fluct = np.random.normal(0, target_mean * deviation * 0.5)
+            y[i] = target_mean + wave + random_fluct + base_noise[i]
+        elif i < DROP_START:
+            # Phase 4: Pre-drop transition
+            progress = (i - VALID_END) / (DROP_START - VALID_END)
+            y[i] = y[VALID_END] * (1 - 0.2 * progress) + base_noise[i]
+        else:
+            # Phase 5: Exponential drop to 0
+            y[i] = max(0, y[DROP_START] * np.exp(-(i - DROP_START) / 20) + base_noise[i])
     
-    # 状态机：0-爬升，1-稳定波动，2-下降
-    state = 0
-    peak_target = target_mean * (1 + np.random.uniform(-0.1, 0.1))
-    
-    for j in range(len(x)):
-        if j < 20: # 0-20mm 自然爬升
-            current_val += (peak_target * 0.8 - current_val) * 0.1
-            state = 0
-        elif j < 40: # 平稳过渡
-            current_val += (peak_target - current_val) * 0.05
-            if abs(current_val - peak_target) < 0.5:
-                state = 1
-        elif j < 160: # 40-160mm 有效波动区
-            # 模拟真实测试的微小抖动
-            noise = np.random.normal(0, target_mean * dev / 100 * 0.5)
-            current_val = peak_target + noise
-            # 偶尔有个小起伏
-            if np.random.rand() > 0.95:
-                current_val *= 1.05
-            state = 1
-        else: # 160mm后下降
-            current_val *= 0.9
-            if j > 180:
-                current_val *= 0.8
-            
-        y[j] = max(0, current_val) # 不能为负
-        
     return x, y
 
-# 生成3条数据：8, 8, 9
-curves_data = []
-means = [8, 8, 9]
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
-img_filename = "temp_curve_for_excel.png"
-
-fig, ax = plt.subplots(figsize=(10, 5), dpi=150)
-
-for i, mean_val in enumerate(means):
-    x, y = generate_curve_data(mean_val)
-    curves_data.append({"id": i+1, "mean": mean_val, "max": round(np.max(y),2), "min": round(np.min(y),2), "avg": round(np.mean(y),2)})
-    ax.plot(x, y, color=colors[i], linewidth=1.5, label=f'Plot {i+1} (μ={mean_val})')
-
-# 添加辅助线和样式
-ax.axvline(x=40, color='gray', linestyle=':', linewidth=1)
-ax.axvline(x=160, color='gray', linestyle=':', linewidth=1)
-ax.set_xlabel("变形 (mm)")
-ax.set_ylabel("剥离力 (gf)")
-ax.set_title("剥离力测试曲线")
-ax.grid(True, linestyle='--', alpha=0.5)
-ax.legend()
-plt.tight_layout()
-plt.savefig(img_filename)
-plt.close()
-
-print(f"图片已生成: {img_filename}")
-
-# ==========================================
-# 第二步：创建 Excel 报告
-# ==========================================
-print("正在生成 Excel 文件...")
-
-wb = Workbook()
-ws = wb.active
-ws.title = "剥离试验报告"
-
-# 1. 设置列宽
-ws.column_dimensions['A'].width = 15
-ws.column_dimensions['B'].width = 20
-
-# 2. 定义样式
-title_font = Font(name='宋体', size=16, bold=True, color="000000")
-header_font = Font(name='宋体', size=11, bold=True)
-normal_font = Font(name='宋体', size=10)
-center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-left_align = Alignment(horizontal='left', vertical='center', wrap_text=True)
-
-# 3. 顶部标题
-ws.merge_cells('A1:B1')
-ws['A1'] = "东莞市裕达新材料有限公司"
-ws['A1'].font = title_font
-ws['A1'].alignment = center_align
-
-ws.merge_cells('A2:B2')
-ws['A2'] = "剥离试验报告"
-ws['A2'].font = Font(name='宋体', size=14, bold=True)
-ws['A2'].alignment = center_align
-
-# 4. 测试条件表格
-conditions = [
-    ["客户名称", "基顺隆"],
-    ["材料名称", "Material-Test"],
-    ["试验日期", "2024-08-05 10:14:49"],
-    ["试验标准", "GB2792-2014 胶粘带剥离强度的测试方法"],
-    ["试验速度", "300.000mm/min"],
-    ["", ""] # 空行
-]
-
-current_row = 4
-for cond in conditions:
-    c1 = ws.cell(row=current_row, column=1, value=cond[0])
-    c1.font = normal_font
-    c1.alignment = left_align
+# ==================== Excel Report Generator ====================
+def create_excel_report(curves_data: list) -> BytesIO:
+    """
+    Generate Excel report with embedded chart and statistics table
+    Args:
+        curves_data: List of dicts containing curve metadata
+    Returns:
+        BytesIO buffer containing the Excel file
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Peel Test Report"
     
-    c2 = ws.cell(row=current_row, column=2, value=cond[1])
-    c2.font = normal_font
-    c2.alignment = left_align
-    current_row += 1
+    # -------------------- Top Section: Test Metadata --------------------
+    metadata = [
+        ["Company", "Dongguan Yuda New Materials Co., Ltd."],
+        ["Report Title", "Peel Strength Test Report"],
+        ["Customer Name", "Jishunlong"],
+        ["Test Standard", "GB2792-2014 Adhesive Tape Peel Strength Test Method"],
+        ["Test Speed", "300.000 mm/min"],
+        ["Test Date", "2024-08-05 10:14:49"],
+        ["", ""]  # Empty row for spacing
+    ]
+    
+    for row_idx, (key, value) in enumerate(metadata, start=1):
+        cell_key = ws.cell(row=row_idx, column=1, value=key)
+        cell_val = ws.cell(row=row_idx, column=2, value=value)
+        # Style metadata rows
+        cell_key.font = Font(bold=True, size=10)
+        cell_key.alignment = Alignment(horizontal="left", vertical="center")
+        cell_val.font = Font(size=10)
+        cell_val.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row_idx].height = 18
+    
+    # -------------------- Middle Section: Embedded Chart --------------------
+    # Generate chart image first
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=150)
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    
+    for idx, curve in enumerate(curves_data):
+        ax.plot(curve["x"], curve["y"], color=colors[idx], linewidth=1.5, 
+                label=f"Plot {idx+1} (μ={curve['mean']}gf)")
+    
+    # Add s15/e15 markers
+    ax.axvline(x=VALID_START, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
+    ax.axvline(x=VALID_END, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
+    ax.text(VALID_START, ax.get_ylim()[1]*0.95, "s15", ha="center", va="top", fontsize=9)
+    ax.text(VALID_END, ax.get_ylim()[1]*0.95, "e15", ha="center", va="top", fontsize=9)
+    
+    # Chart styling
+    ax.set_xlabel("Displacement (mm)")
+    ax.set_ylabel("Peel Force (gf)")
+    ax.set_title("Peel Force Test Curves")
+    ax.grid(True, color="white", linestyle="-", linewidth=0.8, alpha=0.8)
+    ax.set_facecolor(BG_COLOR)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    
+    # Save chart to buffer and embed in Excel
+    img_buf = BytesIO()
+    plt.savefig(img_buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    img_buf.seek(0)
+    
+    # Insert chart into Excel (starting at row 9, column 1)
+    img = ExcelImage(img_buf)
+    img.width = 650
+    img.height = 300
+    ws.add_image(img, "A9")
+    ws.row_dimensions[9].height = 220  # Adjust row height for chart
+    
+    # -------------------- Bottom Section: Statistics Table --------------------
+    # Table headers
+    table_start_row = 22
+    headers = ["No.", "Target Mean (gf)", "Max Peel Force (gf)", 
+               "Min Peel Force (gf)", "Avg Peel Force (gf)"]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=table_start_row, column=col_idx, value=header)
+        cell.font = Font(bold=True, size=10)
+        cell.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[chr(64 + col_idx)].width = 18
+    
+    # Fill curve data
+    for idx, curve in enumerate(curves_data):
+        row = table_start_row + 1 + idx
+        ws.cell(row=row, column=1, value=f"Plot {idx+1}")
+        ws.cell(row=row, column=2, value=curve["mean"])
+        ws.cell(row=row, column=3, value=round(curve["max"], 3))
+        ws.cell(row=row, column=4, value=round(curve["min"], 3))
+        ws.cell(row=row, column=5, value=round(curve["avg"], 3))
+        # Style data rows
+        for col in range(1, 6):
+            ws.cell(row=row, column=col).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=row, column=col).font = Font(size=10)
+    
+    # Add summary rows (Overall Max/Avg)
+    summary_start = table_start_row + len(curves_data) + 1
+    ws.cell(row=summary_start, column=1, value="Overall Max").font = Font(bold=True, size=10)
+    ws.cell(row=summary_start, column=1).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start, column=3, value=round(max(c["max"] for c in curves_data), 3)).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start, column=4, value=round(max(c["min"] for c in curves_data), 3)).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start, column=5, value=round(max(c["avg"] for c in curves_data), 3)).alignment = Alignment(horizontal="center")
+    
+    ws.cell(row=summary_start+1, column=1, value="Overall Avg").font = Font(bold=True, size=10)
+    ws.cell(row=summary_start+1, column=1).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start+1, column=3, value=round(np.mean([c["max"] for c in curves_data]), 3)).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start+1, column=4, value=round(np.mean([c["min"] for c in curves_data]), 3)).alignment = Alignment(horizontal="center")
+    ws.cell(row=summary_start+1, column=5, value=round(np.mean([c["avg"] for c in curves_data]), 3)).alignment = Alignment(horizontal="center")
+    
+    # Save to buffer
+    excel_buf = BytesIO()
+    wb.save(excel_buf)
+    excel_buf.seek(0)
+    return excel_buf
 
-# 5. 插入图片
-try:
-    img = ExcelImage(img_filename)
-    # 调整图片大小以适应页面，并留出边距
-    img.width = 500
-    img.height = 250
-    # 将图片放置在 D 列附近，跨列居中
-    ws.add_image(img, 'D5')
-    ws.merge_cells('D5:F10') # 合并单元格给图片留空间
-    ws['D5'].alignment = Alignment(horizontal='center', vertical='center')
-except Exception as e:
-    print(f"插入图片失败: {e}")
-    ws['D5'] = "图片插入失败"
+# ==================== Streamlit UI ====================
+def main():
+    st.set_page_config(page_title="Peel Force Analyzer", layout="wide")
+    st.title("📊 Peel Force Test Data Generator")
+    st.caption("Generate simulated peel force curves matching industrial test standards")
+    
+    # Sidebar controls
+    with st.sidebar:
+        st.header("Input Parameters")
+        st.info("Default values pre-filled with your requested data: 8, 8, 9")
+        
+        # Input fields for 3 curves (pre-filled with 8,8,9)
+        mean1 = st.number_input("Curve 1 Mean (gf)", value=8.0, step=0.1)
+        mean2 = st.number_input("Curve 2 Mean (gf)", value=8.0, step=0.1)
+        mean3 = st.number_input("Curve 3 Mean (gf)", value=9.0, step=0.1)
+        
+        deviation = st.slider("Fluctuation Range (%)", min_value=10, max_value=50, value=30, step=5)
+        generate_btn = st.button("🚀 Generate Curves & Report", type="primary")
+    
+    # Main content area
+    if generate_btn:
+        with st.spinner("Generating curves and Excel report..."):
+            # Generate 3 curves with input means
+            input_means = [mean1, mean2, mean3]
+            curves_data = []
+            
+            for mean in input_means:
+                x, y = generate_single_curve(mean, deviation/100)
+                curves_data.append({
+                    "x": x,
+                    "y": y,
+                    "mean": mean,
+                    "max": np.max(y),
+                    "min": np.min(y),
+                    "avg": np.mean(y[y>0])  # Exclude initial 0 values from average
+                })
+            
+            # Display curves
+            st.subheader("Generated Peel Force Curves")
+            fig, ax = plt.subplots(figsize=(10, 5), dpi=120)
+            colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+            
+            for idx, curve in enumerate(curves_data):
+                ax.plot(curve["x"], curve["y"], color=colors[idx], linewidth=1.5,
+                        label=f"Plot {idx+1} (μ={curve['mean']}gf)")
+            
+            # Add s15/e15 markers
+            ax.axvline(x=VALID_START, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
+            ax.axvline(x=VALID_END, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
+            ax.text(VALID_START, ax.get_ylim()[1]*0.95, "s15", ha="center", va="top", fontsize=10)
+            ax.text(VALID_END, ax.get_ylim()[1]*0.95, "e15", ha="center", va="top", fontsize=10)
+            
+            # Chart styling
+            ax.set_xlabel("Displacement (mm)")
+            ax.set_ylabel("Peel Force (gf)")
+            ax.set_title("Peel Force Test Curves")
+            ax.grid(True, color="white", linestyle="-", linewidth=0.8, alpha=0.8)
+            ax.set_facecolor(BG_COLOR)
+            ax.legend(fontsize=9)
+            st.pyplot(fig)
+            
+            # Display statistics table
+            st.subheader("Test Statistics")
+            stats_df = pd.DataFrame({
+                "No.": [f"Plot {i+1}" for i in range(len(curves_data))],
+                "Target Mean (gf)": [c["mean"] for c in curves_data],
+                "Max Peel Force (gf)": [round(c["max"], 3) for c in curves_data],
+                "Min Peel Force (gf)": [round(c["min"], 3) for c in curves_data],
+                "Avg Peel Force (gf)": [round(c["avg"], 3) for c in curves_data]
+            })
+            st.dataframe(stats_df, use_container_width=True)
+            
+            # Download Excel report button
+            excel_buf = create_excel_report(curves_data)
+            st.download_button(
+                label="📥 Download Full Excel Report",
+                data=excel_buf,
+                file_name="peel_force_test_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            st.success("Generation complete! Click the download button above to save the Excel report.")
+    else:
+        st.info("Adjust parameters in the sidebar and click 'Generate Curves & Report' to start.")
 
-# 6. 统计数据表格
-data_start_row = 12
-ws.merge_cells('A12:D12')
-ws['A12'] = "测试数据统计"
-ws['A12'].font = header_font
-ws['A12'].alignment = center_align
-
-# 表头
-headers = ["No.", "目标均值(gf)", "实测最大(gf)", "实测平均(gf)"]
-for col_num, header in enumerate(headers, 1):
-    cell = ws.cell(row=data_start_row + 1, column=col_num, value=header)
-    cell.font = header_font
-    cell.alignment = center_align
-    cell.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid") # 浅蓝背景
-
-# 填充数据
-for i, data in enumerate(curves_data):
-    row_idx = data_start_row + 2 + i
-    ws.cell(row=row_idx, column=1, value=f"Plot {data['id']}").alignment = center_align
-    ws.cell(row=row_idx, column=2, value=data['mean']).alignment = center_align
-    ws.cell(row=row_idx, column=3, value=data['max']).alignment = center_align
-    ws.cell(row=row_idx, column=4, value=data['avg']).alignment = center_align
-
-# 保存
-excel_filename = "剥离试验报告_样本.xlsx"
-wb.save(excel_filename)
-
-# 清理临时图片
-if os.path.exists(img_filename):
-    os.remove(img_filename)
-
-print(f"✅ 成功生成 Excel 报告: {excel_filename}")
+if __name__ == "__main__":
+    main()
